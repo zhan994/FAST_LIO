@@ -157,5 +157,7 @@ private:
   double edgea, edgeb;
   double smallp_intersect, smallp_ratio;
   double vx, vy, vz;
+
+  double head_time = 0.;
 };
 #endif

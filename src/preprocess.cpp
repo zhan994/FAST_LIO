@@ -77,6 +77,10 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg,
   case MARSIM:
     sim_handler(msg);
     break;
+  
+  case RSLiDAR:
+    robosense_handler(msg);
+    break;
 
   default:
     printf("Error LiDAR Type");
