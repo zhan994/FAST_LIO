@@ -1,3 +1,20 @@
+## AgriLiRa4D Dataset
+
+Install prerequisites including `ROS>=Noetic`, `Eigen>=3.3.4`, and `PCL>=1.8`.
+
+```
+cd ~/$A_ROS_DIR$/src
+git clone git@github.com:zhan994/FAST_LIO.git
+cd FAST_LIO
+git checkout agrilira4d
+cd ../..
+catkin_make
+source devel/setup.bash
+
+roslaunch fast_lio mapping_agrilira4d.launch
+```
+
+
 ## Related Works and Extended Application
 
 **SLAM:**
