@@ -50,6 +50,8 @@ public:
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  bool IsInitialized() const;
+  double AccelerationScale() const;
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,
                esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state,
@@ -144,6 +146,13 @@ void ImuProcess::set_acc_cov(const V3D &scaler) { cov_acc_scale = scaler; }
 void ImuProcess::set_gyr_bias_cov(const V3D &b_g) { cov_bias_gyr = b_g; }
 
 void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
+
+bool ImuProcess::IsInitialized() const { return !imu_need_init_; }
+
+double ImuProcess::AccelerationScale() const {
+  const double mean_acc_norm = mean_acc.norm();
+  return mean_acc_norm > 1e-6 ? G_m_s2 / mean_acc_norm : 1.0;
+}
 
 void ImuProcess::IMU_init(
     const MeasureGroup &meas,

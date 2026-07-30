@@ -33,7 +33,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include "IMU_Processing.hpp"
+#include "flu_odom_transformer.hpp"
 #include "preprocess.h"
+#include <algorithm>
 #include <Eigen/Core>
 #include <Python.h>
 #include <csignal>
@@ -75,7 +77,7 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0,
     kdtree_delete_counter = 0;
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false,
-     extrinsic_est_en = true, path_en = true;
+     extrinsic_est_en = true, path_en = true, high_rate_odom_en = false;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -88,6 +90,9 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+string high_rate_odom_topic = "/Odometry_high_rate";
+string high_rate_odom_frame_id = "camera_init";
+string high_rate_odom_child_frame_id = "body_flu";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -109,6 +114,14 @@ vector<BoxPointType> cub_needrm;
 vector<PointVector> Nearest_Points;
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
+vector<double> imu_to_intermediate_R{1.0, 0.0, 0.0,
+                                     0.0, 1.0, 0.0,
+                                     0.0, 0.0, 1.0};
+vector<double> imu_to_intermediate_T(3, 0.0);
+vector<double> intermediate_to_flu_R{1.0, 0.0, 0.0,
+                                     0.0, 1.0, 0.0,
+                                     0.0, 0.0, 1.0};
+vector<double> intermediate_to_flu_T(3, 0.0);
 deque<double> time_buffer;
 deque<PointCloudXYZI::Ptr> lidar_buffer;
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
@@ -147,6 +160,190 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+shared_ptr<fast_lio::FluOdomTransformer> flu_odom_transformer;
+ros::Publisher pub_high_rate_odom;
+
+class ImuOdomPredictor {
+public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  void Reset(const state_ikfom &state, double timestamp,
+             const sensor_msgs::Imu::ConstPtr &last_imu) {
+    rotation_world_imu_ = state.rot.toRotationMatrix();
+    position_world_imu_ = state.pos;
+    velocity_world_imu_ = state.vel;
+    gyro_bias_ = state.bg;
+    accel_bias_ = state.ba;
+    gravity_world_ << state.grav[0], state.grav[1], state.grav[2];
+    angular_velocity_imu_.setZero();
+    timestamp_ = timestamp;
+    last_imu_ = last_imu;
+    initialized_ =
+        std::isfinite(timestamp_) && rotation_world_imu_.allFinite() &&
+        position_world_imu_.allFinite() && velocity_world_imu_.allFinite() &&
+        gyro_bias_.allFinite() && accel_bias_.allFinite() &&
+        gravity_world_.allFinite();
+  }
+
+  void Invalidate() {
+    initialized_ = false;
+    timestamp_ = -1.0;
+    last_imu_.reset();
+  }
+
+  bool Predict(const sensor_msgs::Imu::ConstPtr &imu,
+               double acceleration_scale) {
+    if (!initialized_ || !imu) {
+      return false;
+    }
+
+    const double imu_timestamp = imu->header.stamp.toSec();
+    if (!std::isfinite(imu_timestamp)) {
+      Invalidate();
+      return false;
+    }
+    if (imu_timestamp <= timestamp_) {
+      return false;
+    }
+
+    const V3D current_angular_velocity(
+        imu->angular_velocity.x, imu->angular_velocity.y,
+        imu->angular_velocity.z);
+    V3D angular_velocity_average = current_angular_velocity;
+    V3D linear_acceleration_average(
+        imu->linear_acceleration.x, imu->linear_acceleration.y,
+        imu->linear_acceleration.z);
+    if (last_imu_) {
+      angular_velocity_average +=
+          V3D(last_imu_->angular_velocity.x, last_imu_->angular_velocity.y,
+              last_imu_->angular_velocity.z);
+      linear_acceleration_average +=
+          V3D(last_imu_->linear_acceleration.x,
+              last_imu_->linear_acceleration.y,
+              last_imu_->linear_acceleration.z);
+      angular_velocity_average *= 0.5;
+      linear_acceleration_average *= 0.5;
+    }
+
+    if (!current_angular_velocity.allFinite() ||
+        !angular_velocity_average.allFinite() ||
+        !linear_acceleration_average.allFinite() ||
+        !std::isfinite(acceleration_scale)) {
+      Invalidate();
+      return false;
+    }
+
+    const double dt = imu_timestamp - timestamp_;
+    if (dt > 0.2) {
+      Invalidate();
+      return false;
+    }
+
+    const V3D propagation_angular_velocity =
+        angular_velocity_average - gyro_bias_;
+    linear_acceleration_average *= acceleration_scale;
+
+    const M3D rotation_mid =
+        rotation_world_imu_ *
+        Exp(propagation_angular_velocity, 0.5 * dt);
+    const V3D acceleration_world =
+        rotation_mid * (linear_acceleration_average - accel_bias_) +
+        gravity_world_;
+
+    position_world_imu_ +=
+        velocity_world_imu_ * dt + 0.5 * acceleration_world * dt * dt;
+    velocity_world_imu_ += acceleration_world * dt;
+    rotation_world_imu_ =
+        (Eigen::Quaterniond(rotation_world_imu_) *
+         Eigen::Quaterniond(Exp(propagation_angular_velocity, dt)))
+            .normalized()
+            .toRotationMatrix();
+
+    angular_velocity_imu_ = current_angular_velocity - gyro_bias_;
+    timestamp_ = imu_timestamp;
+    last_imu_ = imu;
+    return true;
+  }
+
+  double Timestamp() const { return timestamp_; }
+  const M3D &RotationWorldImu() const { return rotation_world_imu_; }
+  const V3D &PositionWorldImu() const { return position_world_imu_; }
+  const V3D &VelocityWorldImu() const { return velocity_world_imu_; }
+  const V3D &AngularVelocityImu() const { return angular_velocity_imu_; }
+
+private:
+  bool initialized_ = false;
+  double timestamp_ = -1.0;
+  sensor_msgs::Imu::ConstPtr last_imu_;
+  M3D rotation_world_imu_ = Eye3d;
+  V3D position_world_imu_ = Zero3d;
+  V3D velocity_world_imu_ = Zero3d;
+  V3D gyro_bias_ = Zero3d;
+  V3D accel_bias_ = Zero3d;
+  V3D gravity_world_ = Zero3d;
+  V3D angular_velocity_imu_ = Zero3d;
+};
+
+ImuOdomPredictor high_rate_odom_predictor;
+
+void publish_high_rate_odometry(const sensor_msgs::Imu::ConstPtr &imu) {
+  if (!high_rate_odom_en || !flu_odom_transformer ||
+      !high_rate_odom_predictor.Predict(imu,
+                                        p_imu->AccelerationScale())) {
+    return;
+  }
+
+  const fast_lio::FluOdomKinematics output =
+      flu_odom_transformer->Transform(
+          high_rate_odom_predictor.RotationWorldImu(),
+          high_rate_odom_predictor.PositionWorldImu(),
+          high_rate_odom_predictor.VelocityWorldImu(),
+          high_rate_odom_predictor.AngularVelocityImu());
+  const Eigen::Quaterniond orientation(output.rotation_world_flu);
+
+  nav_msgs::Odometry odom;
+  odom.header.stamp =
+      ros::Time().fromSec(high_rate_odom_predictor.Timestamp());
+  odom.header.frame_id = high_rate_odom_frame_id;
+  odom.child_frame_id = high_rate_odom_child_frame_id;
+  odom.pose.pose.position.x = output.position_world_flu.x();
+  odom.pose.pose.position.y = output.position_world_flu.y();
+  odom.pose.pose.position.z = output.position_world_flu.z();
+  odom.pose.pose.orientation.x = orientation.x();
+  odom.pose.pose.orientation.y = orientation.y();
+  odom.pose.pose.orientation.z = orientation.z();
+  odom.pose.pose.orientation.w = orientation.w();
+
+  // Required interface convention: linear velocity is expressed in the
+  // camera_init world frame; angular velocity is expressed in body_flu.
+  odom.twist.twist.linear.x = output.linear_velocity_world_flu.x();
+  odom.twist.twist.linear.y = output.linear_velocity_world_flu.y();
+  odom.twist.twist.linear.z = output.linear_velocity_world_flu.z();
+  odom.twist.twist.angular.x = output.angular_velocity_flu.x();
+  odom.twist.twist.angular.y = output.angular_velocity_flu.y();
+  odom.twist.twist.angular.z = output.angular_velocity_flu.z();
+  pub_high_rate_odom.publish(odom);
+}
+
+void reset_high_rate_odometry() {
+  if (!high_rate_odom_en || !p_imu->IsInitialized() ||
+      Measures.imu.empty()) {
+    return;
+  }
+
+  // Re-anchor the predictor at every LiDAR correction, then replay any IMU
+  // samples newer than the corrected LiDAR frame.
+  high_rate_odom_predictor.Reset(state_point, lidar_end_time,
+                                 Measures.imu.back());
+  const double acceleration_scale = p_imu->AccelerationScale();
+  for (const auto &imu : imu_buffer) {
+    if (!high_rate_odom_predictor.Predict(imu, acceleration_scale)) {
+      ROS_WARN_THROTTLE(1.0,
+                        "Unable to replay IMU for high-rate FLU odometry");
+      break;
+    }
+  }
+}
 
 void SigHandle(int sig) {
   flg_exit = true;
@@ -368,12 +565,14 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) {
   if (timestamp < last_timestamp_imu) {
     ROS_WARN("imu loop back, clear buffer");
     imu_buffer.clear();
+    high_rate_odom_predictor.Invalidate();
   }
 
   last_timestamp_imu = timestamp;
 
   imu_buffer.push_back(msg);
   mtx_buffer.unlock();
+  publish_high_rate_odometry(msg);
   sig_buffer.notify_all();
 }
 
@@ -782,6 +981,13 @@ int main(int argc, char **argv) {
   nh.param<bool>("publish/scan_publish_en", scan_pub_en, true);
   nh.param<bool>("publish/dense_publish_en", dense_pub_en, true);
   nh.param<bool>("publish/scan_bodyframe_pub_en", scan_body_pub_en, true);
+  nh.param<bool>("flu_odom/enabled", high_rate_odom_en, false);
+  nh.param<string>("flu_odom/topic", high_rate_odom_topic,
+                   "/Odometry_high_rate");
+  nh.param<string>("flu_odom/frame_id", high_rate_odom_frame_id,
+                   "camera_init");
+  nh.param<string>("flu_odom/child_frame_id", high_rate_odom_child_frame_id,
+                   "body_flu");
   nh.param<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
   nh.param<string>("map_file_path", map_file_path, "");
   nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
@@ -812,6 +1018,40 @@ int main(int argc, char **argv) {
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
   nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+  nh.param<vector<double>>("flu_odom/imu_to_intermediate_R",
+                           imu_to_intermediate_R,
+                           vector<double>());
+  nh.param<vector<double>>("flu_odom/imu_to_intermediate_T",
+                           imu_to_intermediate_T,
+                           vector<double>());
+  nh.param<vector<double>>("flu_odom/intermediate_to_flu_R",
+                           intermediate_to_flu_R,
+                           vector<double>());
+  nh.param<vector<double>>("flu_odom/intermediate_to_flu_T",
+                           intermediate_to_flu_T,
+                           vector<double>());
+
+  const auto valid_vector = [](const vector<double> &values,
+                               std::size_t expected_size) {
+    return values.size() == expected_size &&
+           std::all_of(values.begin(), values.end(),
+                       [](double value) { return std::isfinite(value); });
+  };
+  if (high_rate_odom_en &&
+      (!valid_vector(imu_to_intermediate_R, 9) ||
+       !valid_vector(imu_to_intermediate_T, 3) ||
+       !valid_vector(intermediate_to_flu_R, 9) ||
+       !valid_vector(intermediate_to_flu_T, 3))) {
+    ROS_FATAL("flu_odom rotations must contain 9 finite values and "
+              "translations must contain 3 finite values");
+    return 1;
+  }
+  if (high_rate_odom_en &&
+      (high_rate_odom_topic.empty() || high_rate_odom_frame_id.empty() ||
+       high_rate_odom_child_frame_id.empty())) {
+    ROS_FATAL("flu_odom topic and frame names must not be empty");
+    return 1;
+  }
 
   p_pre->lidar_type = lidar_type;
   cout << "p_pre->lidar_type " << p_pre->lidar_type << endl;
@@ -842,6 +1082,35 @@ int main(int argc, char **argv) {
 
   Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
   Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
+
+  if (high_rate_odom_en) {
+    M3D rotation_intermediate_imu;
+    M3D rotation_flu_intermediate;
+    V3D translation_intermediate_imu;
+    V3D translation_flu_intermediate;
+    rotation_intermediate_imu << MAT_FROM_ARRAY(imu_to_intermediate_R);
+    rotation_flu_intermediate << MAT_FROM_ARRAY(intermediate_to_flu_R);
+    translation_intermediate_imu << VEC_FROM_ARRAY(imu_to_intermediate_T);
+    translation_flu_intermediate << VEC_FROM_ARRAY(intermediate_to_flu_T);
+
+    const auto valid_rotation = [](const M3D &rotation) {
+      return (rotation.transpose() * rotation - M3D::Identity()).norm() <
+                 1e-6 &&
+             std::abs(rotation.determinant() - 1.0) < 1e-6;
+    };
+    if (!valid_rotation(rotation_intermediate_imu) ||
+        !valid_rotation(rotation_flu_intermediate)) {
+      ROS_FATAL("flu_odom rotation matrices must be right-handed, "
+                "orthonormal SO(3) matrices");
+      return 1;
+    }
+
+    flu_odom_transformer =
+        std::make_shared<fast_lio::FluOdomTransformer>(
+            rotation_intermediate_imu, translation_intermediate_imu,
+            rotation_flu_intermediate, translation_flu_intermediate);
+  }
+
   p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
   p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
   p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
@@ -884,6 +1153,14 @@ int main(int argc, char **argv) {
       nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100000);
   ros::Publisher pubOdomAftMapped =
       nh.advertise<nav_msgs::Odometry>("/Odometry", 100000);
+  if (high_rate_odom_en) {
+    pub_high_rate_odom =
+        nh.advertise<nav_msgs::Odometry>(high_rate_odom_topic, 1000);
+    ROS_INFO("High-rate FLU odometry: %s (%s -> %s); linear velocity is in %s",
+             high_rate_odom_topic.c_str(), high_rate_odom_frame_id.c_str(),
+             high_rate_odom_child_frame_id.c_str(),
+             high_rate_odom_frame_id.c_str());
+  }
   ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", 100000);
   //------------------------------------------------------------------------------------------------------
   signal(SIGINT, SigHandle);
@@ -999,6 +1276,7 @@ int main(int argc, char **argv) {
 
       /******* Publish odometry *******/
       publish_odometry(pubOdomAftMapped);
+      reset_high_rate_odometry();
       /******* Record FLU odometry *******/
       record_flu_odom(fout_evo);
 

@@ -25,6 +25,30 @@ mapping:
                     -1.0, 0.0,  0.0,
                     0.0,  0.0, -1.0 ]
 
+# IMU-rate odometry output.
+# Transform convention:
+#   p_intermediate = R_intermediate_imu * p_imu + t_intermediate_imu
+#   p_flu          = R_flu_intermediate * p_intermediate + t_flu_intermediate
+# The Airy intermediate/LiDAR frame is mounted nose-down by 30 degrees in FLU.
+flu_odom:
+    enabled: true
+    topic: "/Odometry_high_rate"
+    frame_id: "camera_init"       # pose, position and linear velocity world frame
+    child_frame_id: "body_flu"    # x-forward, y-left, z-up vehicle body
+
+    # Airy raw IMU -> Airy product/intermediate frame (fixed axis relation):
+    # x_mid = -y_imu, y_mid = -x_imu, z_mid = -z_imu.
+    imu_to_intermediate_R: [ 0.0, -1.0,  0.0,
+                            -1.0,  0.0,  0.0,
+                             0.0,  0.0, -1.0 ]
+    imu_to_intermediate_T: [0.0, 0.0, 0.0]
+
+    # Nose-down 30-degree intermediate frame -> level vehicle FLU.
+    intermediate_to_flu_R: [ 0.8660254037844386, 0.0, 0.5,
+                              0.0,                1.0, 0.0,
+                             -0.5,                0.0, 0.8660254037844386 ]
+    intermediate_to_flu_T: [0.0, 0.0, 0.0]
+
 publish:
     path_en:  false
     scan_publish_en:  true       # false: close all the point cloud output
