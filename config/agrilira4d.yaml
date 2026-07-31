@@ -56,8 +56,9 @@ flu_odom:
 publish:
     path_en:  false
     scan_publish_en:  true       # false: close all the point cloud output
-    dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
-    scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+    dense_publish_en: false       # false: low down the points number in a global-frame point clouds scan.
+    scan_bodyframe_pub_en: false  # true: output the point cloud scans in IMU-body-frame
+    scan_flu_pub_en: true        # true: output /cloud_registered_flu in flu_odom/frame_id
 
 pcd_save:
     pcd_save_en: false

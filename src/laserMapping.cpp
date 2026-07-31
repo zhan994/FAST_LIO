@@ -106,7 +106,8 @@ int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0,
     laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool point_selected_surf[100000] = {0};
 bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false,
+     scan_flu_pub_en = false;
 int lidar_type;
 
 vector<vector<int>> pointSearchInd_surf;
@@ -117,6 +118,7 @@ vector<double> extrinR(9, 0.0);
 vector<double> R_camera_init_flu_camera_init{1.0, 0.0, 0.0,
                                              0.0, 1.0, 0.0,
                                              0.0, 0.0, 1.0};
+M3D rotation_camera_init_flu_camera_init = M3D::Identity();
 vector<double> R_intermediate_imu{1.0, 0.0, 0.0,
                                   0.0, 1.0, 0.0,
                                   0.0, 0.0, 1.0};
@@ -699,16 +701,32 @@ void map_incremental() {
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(const ros::Publisher &pubLaserCloudFull) {
+void publish_frame_world(const ros::Publisher &pubLaserCloudFull,
+                         const ros::Publisher &pubLaserCloudFullFlu) {
   if (scan_pub_en) {
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort
                                                        : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    PointCloudXYZI::Ptr laserCloudWorldFlu;
+    if (scan_flu_pub_en && flu_odom_transformer) {
+      laserCloudWorldFlu.reset(new PointCloudXYZI(size, 1));
+    }
 
     for (int i = 0; i < size; i++) {
       RGBpointBodyToWorld(&laserCloudFullRes->points[i],
                           &laserCloudWorld->points[i]);
+      if (laserCloudWorldFlu) {
+        laserCloudWorldFlu->points[i] = laserCloudWorld->points[i];
+        const V3D point_camera_init(laserCloudWorld->points[i].x,
+                                    laserCloudWorld->points[i].y,
+                                    laserCloudWorld->points[i].z);
+        const V3D point_flu =
+            rotation_camera_init_flu_camera_init * point_camera_init;
+        laserCloudWorldFlu->points[i].x = point_flu.x();
+        laserCloudWorldFlu->points[i].y = point_flu.y();
+        laserCloudWorldFlu->points[i].z = point_flu.z();
+      }
     }
 
     sensor_msgs::PointCloud2 laserCloudmsg;
@@ -716,6 +734,13 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull) {
     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.frame_id = "camera_init";
     pubLaserCloudFull.publish(laserCloudmsg);
+    if (laserCloudWorldFlu) {
+      sensor_msgs::PointCloud2 laserCloudFluMsg;
+      pcl::toROSMsg(*laserCloudWorldFlu, laserCloudFluMsg);
+      laserCloudFluMsg.header.stamp = laserCloudmsg.header.stamp;
+      laserCloudFluMsg.header.frame_id = high_rate_odom_frame_id;
+      pubLaserCloudFullFlu.publish(laserCloudFluMsg);
+    }
     publish_count -= PUBFRAME_PERIOD;
   }
 
@@ -991,6 +1016,7 @@ int main(int argc, char **argv) {
   nh.param<bool>("publish/scan_publish_en", scan_pub_en, true);
   nh.param<bool>("publish/dense_publish_en", dense_pub_en, true);
   nh.param<bool>("publish/scan_bodyframe_pub_en", scan_body_pub_en, true);
+  nh.param<bool>("publish/scan_flu_pub_en", scan_flu_pub_en, false);
   nh.param<bool>("flu_odom/enabled", high_rate_odom_en, false);
   nh.param<string>("flu_odom/topic", high_rate_odom_topic,
                    "/Odometry_high_rate");
@@ -1098,7 +1124,6 @@ int main(int argc, char **argv) {
   Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
 
   if (high_rate_odom_en) {
-    M3D rotation_camera_init_flu_camera_init;
     M3D rotation_intermediate_imu;
     M3D rotation_body_flu_intermediate;
     V3D translation_intermediate_imu;
@@ -1168,6 +1193,11 @@ int main(int argc, char **argv) {
   ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
   ros::Publisher pubLaserCloudFull =
       nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);
+  ros::Publisher pubLaserCloudFullFlu;
+  if (high_rate_odom_en && scan_flu_pub_en) {
+    pubLaserCloudFullFlu = nh.advertise<sensor_msgs::PointCloud2>(
+        "/cloud_registered_flu", 100000);
+  }
   ros::Publisher pubLaserCloudFull_body =
       nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);
   ros::Publisher pubLaserCloudEffect =
@@ -1312,7 +1342,7 @@ int main(int argc, char **argv) {
       if (path_en)
         publish_path(pubPath);
       if (scan_pub_en || pcd_save_en)
-        publish_frame_world(pubLaserCloudFull);
+        publish_frame_world(pubLaserCloudFull, pubLaserCloudFullFlu);
       if (scan_pub_en && scan_body_pub_en)
         publish_frame_body(pubLaserCloudFull_body);
       // publish_effect_world(pubLaserCloudEffect);
