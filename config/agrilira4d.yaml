@@ -25,37 +25,42 @@ mapping:
                     -1.0, 0.0,  0.0,
                     0.0,  0.0, -1.0 ]
 
-# IMU-rate odometry output.
-# Transform convention:
-#   p_intermediate = R_intermediate_imu * p_imu + t_intermediate_imu
-#   p_flu          = R_flu_intermediate * p_intermediate + t_flu_intermediate
-# The Airy intermediate/LiDAR frame is mounted nose-down by 30 degrees in FLU.
+# IMU 频率的 FLU 里程计输出。
+# 目标坐标 = R * 原坐标 + T
+
 flu_odom:
     enabled: true
     topic: "/Odometry_high_rate"
-    frame_id: "camera_init"       # pose, position and linear velocity world frame
-    child_frame_id: "body_flu"    # x-forward, y-left, z-up vehicle body
+    frame_id: "camera_init_flu"   # 位姿、位置和线速度所在的 FLU 世界坐标系
+    child_frame_id: "body_flu"    # 飞机机体系：X 向前、Y 向左、Z 向上
 
-    # Airy raw IMU -> Airy product/intermediate frame (fixed axis relation):
-    # x_mid = -y_imu, y_mid = -x_imu, z_mid = -z_imu.
-    imu_to_intermediate_R: [ 0.0, -1.0,  0.0,
-                            -1.0,  0.0,  0.0,
-                             0.0,  0.0, -1.0 ]
-    imu_to_intermediate_T: [0.0, 0.0, 0.0]
+    # 矩阵命名约定：R_目标坐标系_源坐标系。
 
-    # Nose-down 30-degree intermediate frame -> level vehicle FLU.
-    intermediate_to_flu_R: [ 0.8660254037844386, 0.0, 0.5,
-                              0.0,                1.0, 0.0,
-                             -0.5,                0.0, 0.8660254037844386 ]
-    intermediate_to_flu_T: [0.0, 0.0, 0.0]
+    # 原始 camera_init 世界系 -> camera_init_flu 世界系
+    R_camera_init_flu_camera_init: [ 0.0,  1.0, 0.0,
+                                    -1.0,  0.0, 0.0,
+                                     0.0,  0.0, 1.0 ]
+
+    # Airy 原始 IMU 坐标系 -> Airy 中间坐标系
+    R_intermediate_imu: [ 0.0, -1.0,  0.0,
+                         -1.0,  0.0,  0.0,
+                          0.0,  0.0, -1.0 ]
+    t_intermediate_imu: [0.0, 0.0, 0.0]
+
+    # Airy 中间坐标系 -> 水平的飞机 body_flu 机体系
+    R_body_flu_intermediate: [ 0.8660254037844386, 0.0, 0.5,
+                                0.0,                1.0, 0.0,
+                               -0.5,                0.0, 0.8660254037844386 ]
+    t_body_flu_intermediate: [0.0, 0.0, 0.0]
 
 publish:
     path_en:  false
     scan_publish_en:  true       # false: close all the point cloud output
-    dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
-    scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+    dense_publish_en: false       # false: low down the points number in a global-frame point clouds scan.
+    scan_bodyframe_pub_en: false  # true: output the point cloud scans in IMU-body-frame
+    scan_flu_pub_en: true        # true: output /cloud_registered_flu in flu_odom/frame_id
 
 pcd_save:
-    pcd_save_en: true
+    pcd_save_en: false
     interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                  # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

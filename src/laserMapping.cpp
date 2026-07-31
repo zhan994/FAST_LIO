@@ -91,7 +91,7 @@ condition_variable sig_buffer;
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 string high_rate_odom_topic = "/Odometry_high_rate";
-string high_rate_odom_frame_id = "camera_init";
+string high_rate_odom_frame_id = "camera_init_flu";
 string high_rate_odom_child_frame_id = "body_flu";
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -106,7 +106,8 @@ int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0,
     laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool point_selected_surf[100000] = {0};
 bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false,
+     scan_flu_pub_en = false;
 int lidar_type;
 
 vector<vector<int>> pointSearchInd_surf;
@@ -114,14 +115,18 @@ vector<BoxPointType> cub_needrm;
 vector<PointVector> Nearest_Points;
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
-vector<double> imu_to_intermediate_R{1.0, 0.0, 0.0,
-                                     0.0, 1.0, 0.0,
-                                     0.0, 0.0, 1.0};
-vector<double> imu_to_intermediate_T(3, 0.0);
-vector<double> intermediate_to_flu_R{1.0, 0.0, 0.0,
-                                     0.0, 1.0, 0.0,
-                                     0.0, 0.0, 1.0};
-vector<double> intermediate_to_flu_T(3, 0.0);
+vector<double> R_camera_init_flu_camera_init{1.0, 0.0, 0.0,
+                                             0.0, 1.0, 0.0,
+                                             0.0, 0.0, 1.0};
+M3D rotation_camera_init_flu_camera_init = M3D::Identity();
+vector<double> R_intermediate_imu{1.0, 0.0, 0.0,
+                                  0.0, 1.0, 0.0,
+                                  0.0, 0.0, 1.0};
+vector<double> t_intermediate_imu(3, 0.0);
+vector<double> R_body_flu_intermediate{1.0, 0.0, 0.0,
+                                       0.0, 1.0, 0.0,
+                                       0.0, 0.0, 1.0};
+vector<double> t_body_flu_intermediate(3, 0.0);
 deque<double> time_buffer;
 deque<PointCloudXYZI::Ptr> lidar_buffer;
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
@@ -299,29 +304,36 @@ void publish_high_rate_odometry(const sensor_msgs::Imu::ConstPtr &imu) {
           high_rate_odom_predictor.PositionWorldImu(),
           high_rate_odom_predictor.VelocityWorldImu(),
           high_rate_odom_predictor.AngularVelocityImu());
-  const Eigen::Quaterniond orientation(output.rotation_world_flu);
+  const Eigen::Quaterniond orientation(
+      output.rotation_camera_init_flu_body_flu);
 
   nav_msgs::Odometry odom;
   odom.header.stamp =
       ros::Time().fromSec(high_rate_odom_predictor.Timestamp());
   odom.header.frame_id = high_rate_odom_frame_id;
   odom.child_frame_id = high_rate_odom_child_frame_id;
-  odom.pose.pose.position.x = output.position_world_flu.x();
-  odom.pose.pose.position.y = output.position_world_flu.y();
-  odom.pose.pose.position.z = output.position_world_flu.z();
+  odom.pose.pose.position.x =
+      output.position_camera_init_flu_body_flu.x();
+  odom.pose.pose.position.y =
+      output.position_camera_init_flu_body_flu.y();
+  odom.pose.pose.position.z =
+      output.position_camera_init_flu_body_flu.z();
   odom.pose.pose.orientation.x = orientation.x();
   odom.pose.pose.orientation.y = orientation.y();
   odom.pose.pose.orientation.z = orientation.z();
   odom.pose.pose.orientation.w = orientation.w();
 
-  // Required interface convention: linear velocity is expressed in the
-  // camera_init world frame; angular velocity is expressed in body_flu.
-  odom.twist.twist.linear.x = output.linear_velocity_world_flu.x();
-  odom.twist.twist.linear.y = output.linear_velocity_world_flu.y();
-  odom.twist.twist.linear.z = output.linear_velocity_world_flu.z();
-  odom.twist.twist.angular.x = output.angular_velocity_flu.x();
-  odom.twist.twist.angular.y = output.angular_velocity_flu.y();
-  odom.twist.twist.angular.z = output.angular_velocity_flu.z();
+  // Linear velocity is expressed in camera_init_flu; angular velocity is
+  // expressed in body_flu.
+  odom.twist.twist.linear.x =
+      output.linear_velocity_camera_init_flu.x();
+  odom.twist.twist.linear.y =
+      output.linear_velocity_camera_init_flu.y();
+  odom.twist.twist.linear.z =
+      output.linear_velocity_camera_init_flu.z();
+  odom.twist.twist.angular.x = output.angular_velocity_body_flu.x();
+  odom.twist.twist.angular.y = output.angular_velocity_body_flu.y();
+  odom.twist.twist.angular.z = output.angular_velocity_body_flu.z();
   pub_high_rate_odom.publish(odom);
 }
 
@@ -689,16 +701,32 @@ void map_incremental() {
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(const ros::Publisher &pubLaserCloudFull) {
+void publish_frame_world(const ros::Publisher &pubLaserCloudFull,
+                         const ros::Publisher &pubLaserCloudFullFlu) {
   if (scan_pub_en) {
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort
                                                        : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    PointCloudXYZI::Ptr laserCloudWorldFlu;
+    if (scan_flu_pub_en && flu_odom_transformer) {
+      laserCloudWorldFlu.reset(new PointCloudXYZI(size, 1));
+    }
 
     for (int i = 0; i < size; i++) {
       RGBpointBodyToWorld(&laserCloudFullRes->points[i],
                           &laserCloudWorld->points[i]);
+      if (laserCloudWorldFlu) {
+        laserCloudWorldFlu->points[i] = laserCloudWorld->points[i];
+        const V3D point_camera_init(laserCloudWorld->points[i].x,
+                                    laserCloudWorld->points[i].y,
+                                    laserCloudWorld->points[i].z);
+        const V3D point_flu =
+            rotation_camera_init_flu_camera_init * point_camera_init;
+        laserCloudWorldFlu->points[i].x = point_flu.x();
+        laserCloudWorldFlu->points[i].y = point_flu.y();
+        laserCloudWorldFlu->points[i].z = point_flu.z();
+      }
     }
 
     sensor_msgs::PointCloud2 laserCloudmsg;
@@ -706,6 +734,13 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull) {
     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.frame_id = "camera_init";
     pubLaserCloudFull.publish(laserCloudmsg);
+    if (laserCloudWorldFlu) {
+      sensor_msgs::PointCloud2 laserCloudFluMsg;
+      pcl::toROSMsg(*laserCloudWorldFlu, laserCloudFluMsg);
+      laserCloudFluMsg.header.stamp = laserCloudmsg.header.stamp;
+      laserCloudFluMsg.header.frame_id = high_rate_odom_frame_id;
+      pubLaserCloudFullFlu.publish(laserCloudFluMsg);
+    }
     publish_count -= PUBFRAME_PERIOD;
   }
 
@@ -981,11 +1016,12 @@ int main(int argc, char **argv) {
   nh.param<bool>("publish/scan_publish_en", scan_pub_en, true);
   nh.param<bool>("publish/dense_publish_en", dense_pub_en, true);
   nh.param<bool>("publish/scan_bodyframe_pub_en", scan_body_pub_en, true);
+  nh.param<bool>("publish/scan_flu_pub_en", scan_flu_pub_en, false);
   nh.param<bool>("flu_odom/enabled", high_rate_odom_en, false);
   nh.param<string>("flu_odom/topic", high_rate_odom_topic,
                    "/Odometry_high_rate");
   nh.param<string>("flu_odom/frame_id", high_rate_odom_frame_id,
-                   "camera_init");
+                   "camera_init_flu");
   nh.param<string>("flu_odom/child_frame_id", high_rate_odom_child_frame_id,
                    "body_flu");
   nh.param<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
@@ -1018,17 +1054,20 @@ int main(int argc, char **argv) {
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
   nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
-  nh.param<vector<double>>("flu_odom/imu_to_intermediate_R",
-                           imu_to_intermediate_R,
+  nh.param<vector<double>>("flu_odom/R_camera_init_flu_camera_init",
+                           R_camera_init_flu_camera_init,
                            vector<double>());
-  nh.param<vector<double>>("flu_odom/imu_to_intermediate_T",
-                           imu_to_intermediate_T,
+  nh.param<vector<double>>("flu_odom/R_intermediate_imu",
+                           R_intermediate_imu,
                            vector<double>());
-  nh.param<vector<double>>("flu_odom/intermediate_to_flu_R",
-                           intermediate_to_flu_R,
+  nh.param<vector<double>>("flu_odom/t_intermediate_imu",
+                           t_intermediate_imu,
                            vector<double>());
-  nh.param<vector<double>>("flu_odom/intermediate_to_flu_T",
-                           intermediate_to_flu_T,
+  nh.param<vector<double>>("flu_odom/R_body_flu_intermediate",
+                           R_body_flu_intermediate,
+                           vector<double>());
+  nh.param<vector<double>>("flu_odom/t_body_flu_intermediate",
+                           t_body_flu_intermediate,
                            vector<double>());
 
   const auto valid_vector = [](const vector<double> &values,
@@ -1038,10 +1077,11 @@ int main(int argc, char **argv) {
                        [](double value) { return std::isfinite(value); });
   };
   if (high_rate_odom_en &&
-      (!valid_vector(imu_to_intermediate_R, 9) ||
-       !valid_vector(imu_to_intermediate_T, 3) ||
-       !valid_vector(intermediate_to_flu_R, 9) ||
-       !valid_vector(intermediate_to_flu_T, 3))) {
+      (!valid_vector(R_camera_init_flu_camera_init, 9) ||
+       !valid_vector(R_intermediate_imu, 9) ||
+       !valid_vector(t_intermediate_imu, 3) ||
+       !valid_vector(R_body_flu_intermediate, 9) ||
+       !valid_vector(t_body_flu_intermediate, 3))) {
     ROS_FATAL("flu_odom rotations must contain 9 finite values and "
               "translations must contain 3 finite values");
     return 1;
@@ -1085,21 +1125,26 @@ int main(int argc, char **argv) {
 
   if (high_rate_odom_en) {
     M3D rotation_intermediate_imu;
-    M3D rotation_flu_intermediate;
+    M3D rotation_body_flu_intermediate;
     V3D translation_intermediate_imu;
-    V3D translation_flu_intermediate;
-    rotation_intermediate_imu << MAT_FROM_ARRAY(imu_to_intermediate_R);
-    rotation_flu_intermediate << MAT_FROM_ARRAY(intermediate_to_flu_R);
-    translation_intermediate_imu << VEC_FROM_ARRAY(imu_to_intermediate_T);
-    translation_flu_intermediate << VEC_FROM_ARRAY(intermediate_to_flu_T);
+    V3D translation_body_flu_intermediate;
+    rotation_camera_init_flu_camera_init
+        << MAT_FROM_ARRAY(R_camera_init_flu_camera_init);
+    rotation_intermediate_imu << MAT_FROM_ARRAY(R_intermediate_imu);
+    rotation_body_flu_intermediate
+        << MAT_FROM_ARRAY(R_body_flu_intermediate);
+    translation_intermediate_imu << VEC_FROM_ARRAY(t_intermediate_imu);
+    translation_body_flu_intermediate
+        << VEC_FROM_ARRAY(t_body_flu_intermediate);
 
     const auto valid_rotation = [](const M3D &rotation) {
       return (rotation.transpose() * rotation - M3D::Identity()).norm() <
                  1e-6 &&
              std::abs(rotation.determinant() - 1.0) < 1e-6;
     };
-    if (!valid_rotation(rotation_intermediate_imu) ||
-        !valid_rotation(rotation_flu_intermediate)) {
+    if (!valid_rotation(rotation_camera_init_flu_camera_init) ||
+        !valid_rotation(rotation_intermediate_imu) ||
+        !valid_rotation(rotation_body_flu_intermediate)) {
       ROS_FATAL("flu_odom rotation matrices must be right-handed, "
                 "orthonormal SO(3) matrices");
       return 1;
@@ -1107,8 +1152,11 @@ int main(int argc, char **argv) {
 
     flu_odom_transformer =
         std::make_shared<fast_lio::FluOdomTransformer>(
-            rotation_intermediate_imu, translation_intermediate_imu,
-            rotation_flu_intermediate, translation_flu_intermediate);
+            rotation_camera_init_flu_camera_init,
+            rotation_intermediate_imu,
+            translation_intermediate_imu,
+            rotation_body_flu_intermediate,
+            translation_body_flu_intermediate);
   }
 
   p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
@@ -1145,6 +1193,11 @@ int main(int argc, char **argv) {
   ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
   ros::Publisher pubLaserCloudFull =
       nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);
+  ros::Publisher pubLaserCloudFullFlu;
+  if (high_rate_odom_en && scan_flu_pub_en) {
+    pubLaserCloudFullFlu = nh.advertise<sensor_msgs::PointCloud2>(
+        "/cloud_registered_flu", 100000);
+  }
   ros::Publisher pubLaserCloudFull_body =
       nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);
   ros::Publisher pubLaserCloudEffect =
@@ -1289,7 +1342,7 @@ int main(int argc, char **argv) {
       if (path_en)
         publish_path(pubPath);
       if (scan_pub_en || pcd_save_en)
-        publish_frame_world(pubLaserCloudFull);
+        publish_frame_world(pubLaserCloudFull, pubLaserCloudFullFlu);
       if (scan_pub_en && scan_body_pub_en)
         publish_frame_body(pubLaserCloudFull_body);
       // publish_effect_world(pubLaserCloudEffect);
